@@ -57,7 +57,7 @@ if torch.cuda.is_available():
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-IMGSZ  = int(os.getenv("IMGSZ", "512"))
+IMGSZ  = int(os.getenv("IMGSZ", "640"))
 BATCH  = int(os.getenv("BATCH", "4"))
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LR     = float(os.getenv("LR", "3e-4"))
@@ -157,11 +157,16 @@ def append_log(log_path: Path, epoch, loss,
                miou, pix_acc,
                imgsz, batch, accum, freeze, amp, time_s,
                cls_acc=None, cls_prec=None, cls_rec=None, cls_f1=None, map_val=None):
+    """
+    Append training/validation metrics to CSV log file.
+    Supports both segmentation and classification metrics.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        # หากบางค่าคำนวณไม่ได้ ให้เป็นค่าว่าง
         row = [
-            epoch, f"{loss:.6f}",
+            epoch,
+            f"{loss:.6f}",
             (None if miou is None else f"{miou:.6f}"),
             (None if pix_acc is None else f"{pix_acc:.6f}"),
             (None if cls_acc is None else f"{cls_acc:.6f}"),
@@ -423,16 +428,20 @@ def next_down_imgsz(sz: int) -> int:
             return cand
     return sz
 
-def ensure_log_header(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists() or path.stat().st_size == 0:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("epoch,loss,miou,pixacc,imgsz,batch,accum,freeze,amp,time_sec\n")
+def ensure_log_header(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not log_path.exists():
+        with log_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "epoch","loss",
+                "val_mIoU","val_pixAcc",
+                "val_cls_Acc","val_cls_Precision","val_cls_Recall","val_cls_F1",
+                "val_mAP",
+                "imgsz","batch","accum","freeze","AMP","time_s"
+            ])
 
-def append_log(path: Path, epoch:int, loss:float, miou:float, pixacc:float,
-               imgsz:int, batch:int, accum:int, freeze:int, amp:int, time_sec:float):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{epoch},{loss:.6f},{miou:.6f},{pixacc:.6f},{imgsz},{batch},{accum},{freeze},{amp},{time_sec:.3f}\n")
+
 
 # ----------------- OOM-safe Train (ลด batch/imgsz อัตโนมัติ + AMP fallback + TQDM + CSV) -----------------
 # ====== ส่วนที่แก้ในฟังก์ชัน try_train ======
