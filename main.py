@@ -11,12 +11,12 @@
 #   RF_WORKSPACE=hoi-rmqtp
 #   RF_PROJECT=human-object-interaction-pcpk1
 #   RF_VERSION=2
-#   IMGSZ=512
-#   BATCH=4
+#   IMGSZ=640
+#   BATCH=10
 #   EPOCHS=20
 #   LR=0.0003
 #   ACCUM=8
-#   AMP=0                      # 0=ปิด AMP (แนะนำการ์ด 4GB), 1=เปิด AMP
+#   AMP=1                      # 0=ปิด AMP (แนะนำการ์ด 4GB), 1=เปิด AMP
 #   FREEZE_BACKBONE_EPOCHS=5   # 0=ไม่ freeze
 #   USE_TQDM=1                 # 1=แสดง progress bar
 #   LOG_EVERY=10               # ใช้เมื่อตั้ง USE_TQDM=0
@@ -451,3 +451,4 @@ if len(sys.argv) > 1:
                 pred = model(t)['out'].argmax(1)[0].detach().cpu().numpy().astype(np.uint8)
             Image.fromarray(pred).save(out_dir / (p.stem + "_mask.png"))
             print("Saved:", out_dir / (p.stem + "_mask.png"))
+
