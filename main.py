@@ -1,6 +1,4 @@
-# main.py — Semantic Segmentation (Single-folder)
-# OOM-safe + AMP toggle + Accumulation + TQDM + CSV log + RAM Preload + T4-friendly models
-#
+# main.py — Semantic Segmentation (Single-folder) | OOM-safe + AMP toggle + Accumulation + TQDM + CSV log
 # โครงสร้างชุดข้อมูล:
 #   <DATASET_ROOT>/
 #     train/  -> รูป *.jpg|*.jpeg|*.png (ยกเว้น *_mask.png) + มาสก์คู่ชื่อ *_mask.png
@@ -8,34 +6,25 @@
 #     valid/  -> เช่นเดียวกับ train
 #     test/   -> ถ้ามี
 #
-# .env ตัวอย่าง (แนะนำสำหรับ Colab T4):
+# .env ตัวอย่าง:
 #   RF_API_KEY=...
 #   RF_WORKSPACE=hoi-rmqtp
 #   RF_PROJECT=human-object-interaction-pcpk1
 #   RF_VERSION=2
-#   IMGSZ=640
-#   BATCH=8
+#   IMGSZ=512
+#   BATCH=4
 #   EPOCHS=20
 #   LR=0.0003
-#   ACCUM=4
-#   AMP=1
-#   PRELOAD=1
-#   FREEZE_BACKBONE_EPOCHS=1
-#   NUM_WORKERS=2
-#   MODEL=deeplabv3_resnet50         # deeplabv3_resnet50 | deeplabv3_resnet101 | lraspp_mbv3
-#   COMPILE=0                         # 1 เพื่อใช้ torch.compile (ถ้า PyTorch รองรับ)
-#   USE_TQDM=1
-#   LOG_EVERY=10
+#   ACCUM=8
+#   AMP=0                      # 0=ปิด AMP (แนะนำการ์ด 4GB), 1=เปิด AMP
+#   FREEZE_BACKBONE_EPOCHS=5   # 0=ไม่ freeze
+#   USE_TQDM=1                 # 1=แสดง progress bar
+#   LOG_EVERY=10               # ใช้เมื่อตั้ง USE_TQDM=0
 #   LOG_FILE=runs/semseg/train_log.csv
 
-# main.py — Semantic Segmentation (Single-folder)
-# OOM-safe + AMP toggle + Accumulation + TQDM + CSV log + RAM Preload (optimized) + T4-friendly models
-#
-# จุดเน้นรอบนี้: ลด RAM โดยไม่ช้า — ตัดสำเนาไม่จำเป็น, read-only RAM cache, เก็บกวาดหน่วยความจำเป็นจังหวะ
-
-import os, sys, csv, random, numpy as np, platform, gc
+import os, sys, csv, random, numpy as np
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 from time import time
 
 # ---- CUDA allocator config (safe on all platforms) ----
@@ -43,14 +32,11 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,garbage_
 
 import torch
 import torch.nn as nn
-import torch.backends.cudnn as cudnn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
-from PIL import Image, ImageFile
+from PIL import Image
 from roboflow import Roboflow
 from tqdm import tqdm
-
-ImageFile.LOAD_TRUNCATED_IMAGES = True  # เผื่อภาพบางไฟล์ไม่สมบูรณ์
 
 # โหลด .env ถ้ามี
 try:
@@ -66,22 +52,18 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-cudnn.benchmark = True  # เร่งความเร็ว conv สำหรับ input size คงที่
 
 IMGSZ  = int(os.getenv("IMGSZ", "512"))
 BATCH  = int(os.getenv("BATCH", "4"))
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LR     = float(os.getenv("LR", "3e-4"))
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))      # Windows -> 0 โดยอัตโนมัติด้านล่างเมื่อ PRELOAD=1
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))      # Windows -> 0
 ACCUM  = int(os.getenv("ACCUM", "8"))                 # gradient accumulation steps
 USE_AMP = bool(int(os.getenv("AMP", "0")))            # 0=fp32, 1=AMP
 FREEZE_BACKBONE_EPOCHS = int(os.getenv("FREEZE_BACKBONE_EPOCHS", "5"))
 USE_TQDM = bool(int(os.getenv("USE_TQDM", "1")))
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 LOG_FILE = os.getenv("LOG_FILE", "runs/semseg/train_log.csv")
-PRELOAD = bool(int(os.getenv("PRELOAD", "1")))        # 1=โหลดรูปทั้ง split เข้าแรม
-MODEL_NAME = os.getenv("MODEL", "deeplabv3_resnet50").lower()
-USE_COMPILE = bool(int(os.getenv("COMPILE", "0")))
 
 def env_required(name: str) -> str:
     v = os.getenv(name)
@@ -94,18 +76,8 @@ RF_WORKSPACE = env_required("RF_WORKSPACE")
 RF_PROJECT   = env_required("RF_PROJECT")
 RF_VERSION   = int(os.getenv("RF_VERSION", "1"))
 
-# ลด RAM duplication: บน Windows (spawn) ถ้า PRELOAD=1 ให้บังคับ NUM_WORKERS=0
-if PRELOAD and platform.system() == "Windows" and NUM_WORKERS > 0:
-    print("[INFO] PRELOAD on Windows may duplicate RAM across workers -> forcing NUM_WORKERS=0")
-    NUM_WORKERS = 0
-
 print(f"Device: {DEVICE}")
-print(
-    f"Config -> MODEL={MODEL_NAME} IMGSZ={IMGSZ} BATCH={BATCH} EPOCHS={EPOCHS} "
-    f"LR={LR} ACCUM={ACCUM} AMP={int(USE_AMP)} FREEZE={FREEZE_BACKBONE_EPOCHS} "
-    f"TQDM={int(USE_TQDM)} PRELOAD={int(PRELOAD)} COMPILE={int(USE_COMPILE)} "
-    f"NUM_WORKERS={NUM_WORKERS}"
-)
+print(f"Config -> IMGSZ={IMGSZ} BATCH={BATCH} EPOCHS={EPOCHS} LR={LR} ACCUM={ACCUM} AMP={int(USE_AMP)} FREEZE={FREEZE_BACKBONE_EPOCHS} TQDM={int(USE_TQDM)}")
 
 # ----------------- Download dataset (semantic) -----------------
 print("loading Roboflow workspace...")
@@ -162,95 +134,38 @@ class_names = read_classes(classes_csv)
 num_classes = 1 + len(class_names)  # 0=background
 print(f"Classes ({num_classes}): ['bg', {', '.join(map(str,class_names))}]")
 
-# ----------------- RAM cache helpers -----------------
-RAM_CACHE: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
-
-def _estimate_mem_mb(pairs: List[Tuple[np.ndarray, np.ndarray]]) -> float:
-    total = 0
-    for im, mk in pairs:
-        total += im.nbytes + mk.nbytes
-    return total / (1024**2)
-
-def preload_split_to_ram(split_dir: Path, expected_classes: int) -> List[Tuple[np.ndarray, np.ndarray]]:
-    key = str(split_dir.resolve())
-    if key in RAM_CACHE:
-        return RAM_CACHE[key]
-
-    IMG_EXTS = {".jpg", ".jpeg", ".png"}
-    candidates = [p for p in split_dir.iterdir()
-                  if p.is_file() and p.suffix.lower() in IMG_EXTS and not p.name.endswith("_mask.png")]
-    pairs_path = []
-    for img in candidates:
-        mask = img.with_name(f"{img.stem}_mask.png")
-        if mask.exists():
-            pairs_path.append((img, mask))
-    if not pairs_path:
-        raise FileNotFoundError(f"No valid image/mask pairs (*_mask.png) in {split_dir}")
-
-    mem_pairs: List[Tuple[np.ndarray, np.ndarray]] = []
-    for ip, mp in sorted(pairs_path):
-        # อ่านภาพ -> array (ไม่มี .copy() เพื่อลด RAM; set read-only เพื่อป้องกัน COW กลายเป็น copy)
-        with Image.open(ip) as im:
-            im = im.convert("RGB")
-            im_np = np.array(im, dtype=np.uint8)   # no extra .copy()
-            im_np.setflags(write=False)
-
-        with Image.open(mp) as m:
-            if m.mode in ["P", "L"]:
-                mk_np = np.array(m, dtype=np.uint8)  # no extra .copy()
-            else:
-                arr = np.array(m)
-                h, w = arr.shape[:2]
-                flat = arr.reshape(-1, 3)
-                _, inv = np.unique(flat, axis=0, return_inverse=True)
-                idx_map = inv.reshape(h, w).astype(np.int32)
-                mk_np = np.clip(idx_map, 0, expected_classes-1).astype(np.uint8)
-            # read-only เพื่อช่วย COW
-            mk_np.setflags(write=False)
-
-        mem_pairs.append((im_np, mk_np))
-
-    mem_mb = _estimate_mem_mb(mem_pairs)
-    print(f"[{split_dir.name}] RAM cached pairs: {len(mem_pairs)} (~{mem_mb:.1f} MB)")
-    RAM_CACHE[key] = mem_pairs
-    return mem_pairs
-
-# ----------------- Dataset (single-folder; RAM preload option) -----------------
+# ----------------- Dataset (single-folder: *_mask.png pairing) -----------------
 class SemSegDataset(Dataset):
     """
     โฟลเดอร์เดียว:
       - ภาพ: *.jpg|*.jpeg|*.png (ยกเว้น *_mask.png)
       - มาสก์: <stem>_mask.png  (index mask: 0=bg, 1..C-1)
-    ถ้า PRELOAD=1 -> โหลดภาพทั้งหมดเข้าแรมครั้งเดียว แล้ว resize/normalize ตอน __getitem__
+    ใช้เฉพาะคู่ที่มีครบจริง
     """
-
     IMG_EXTS = {".jpg", ".jpeg", ".png"}
 
-    def __init__(self, split_dir: Path, img_size=512, num_classes: int = 2, preload: bool = True):
+    def __init__(self, split_dir: Path, img_size=512):
         self.split_dir = Path(split_dir)
         self.img_size = img_size
-        self.num_classes = num_classes
-        self.preload = preload
-
         self.tf_img = self._build_tf(img_size)
 
-        if self.preload:
-            self.mem_pairs = preload_split_to_ram(self.split_dir, expected_classes=self.num_classes)
-            self.length = len(self.mem_pairs)
-            print(f"[{self.split_dir.name}] (RAM) pairs: {self.length}")
-        else:
-            candidates = [p for p in self.split_dir.iterdir()
-                          if p.is_file() and p.suffix.lower() in self.IMG_EXTS and not p.name.endswith("_mask.png")]
-            pairs = []
-            for img in candidates:
-                mask = img.with_name(f"{img.stem}_mask.png")
-                if mask.exists():
-                    pairs.append((img, mask))
-            if not pairs:
-                raise FileNotFoundError(f"No valid image/mask pairs (*_mask.png) in {self.split_dir}")
-            self.pairs = sorted(pairs)
-            self.length = len(self.pairs)
-            print(f"[{self.split_dir.name}] (disk) pairs: {self.length}")
+        candidates = [p for p in self.split_dir.iterdir()
+                      if p.is_file()
+                      and p.suffix.lower() in self.IMG_EXTS
+                      and not p.name.endswith("_mask.png")]
+        pairs = []
+        for img in candidates:
+            mask = img.with_name(f"{img.stem}_mask.png")
+            if mask.exists():
+                pairs.append((img, mask))
+        if not pairs:
+            raise FileNotFoundError(f"No valid image/mask pairs (*_mask.png) in {self.split_dir}")
+        self.pairs = sorted(pairs)
+
+        # preview
+        print(f"[{self.split_dir.name}] pairs: {len(self.pairs)}")
+        for img, msk in self.pairs[:5]:
+            print("  ↳", img.name, "->", msk.name)
 
     @staticmethod
     def _build_tf(size):
@@ -264,96 +179,56 @@ class SemSegDataset(Dataset):
         self.img_size = new_size
         self.tf_img = self._build_tf(new_size)
 
-    def __len__(self): return self.length
-
-    @staticmethod
-    def _resize_mask(mask_np: np.ndarray, size: int) -> np.ndarray:
-        m = Image.fromarray(mask_np)
-        m = m.resize((size, size), Image.NEAREST)
-        return np.array(m, dtype=np.int64)
+    def __len__(self): return len(self.pairs)
 
     def __getitem__(self, i):
-        if self.preload:
-            img_np, mask_np = self.mem_pairs[i]
-            # สร้าง PIL ชั่วคราวเฉพาะตอนแปลง (ไม่สำเนา RAM cache)
-            img = Image.fromarray(img_np, mode="RGB")
-            img_t = self.tf_img(img)
-            mask_resized = self._resize_mask(mask_np, self.img_size)
-            return img_t, torch.from_numpy(mask_resized)
+        img_path, mask_path = self.pairs[i]
+        img = Image.open(img_path).convert("RGB")
+
+        m = Image.open(mask_path)
+        if m.mode in ["P", "L"]:
+            mask = np.array(m, dtype=np.uint8)
         else:
-            img_path, mask_path = self.pairs[i]
-            img = Image.open(img_path).convert("RGB")
-            m = Image.open(mask_path)
-            if m.mode in ["P", "L"]:
-                mask = np.array(m, dtype=np.uint8)
-            else:
-                arr = np.array(m)
-                h, w = arr.shape[:2]
-                flat = arr.reshape(-1, 3)
-                _, inv = np.unique(flat, axis=0, return_inverse=True)
-                idx_map = inv.reshape(h, w).astype(np.int32)
-                mask = np.clip(idx_map, 0, self.num_classes-1).astype(np.uint8)
-            img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
-            mask = Image.fromarray(mask).resize((self.img_size, self.img_size), Image.NEAREST)
-            mask = np.array(mask, dtype=np.int64)
-            return self.tf_img(img), torch.from_numpy(mask)
+            # fallback: RGB mask -> map สีเป็น index
+            arr = np.array(m)
+            h, w = arr.shape[:2]
+            flat = arr.reshape(-1, 3)
+            colors, inv = np.unique(flat, axis=0, return_inverse=True)
+            idx_map = inv.reshape(h, w).astype(np.int32)
+            mask = np.clip(idx_map, 0, num_classes-1).astype(np.uint8)
+
+        img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+        mask = Image.fromarray(mask).resize((self.img_size, self.img_size), Image.NEAREST)
+        mask = np.array(mask, dtype=np.int64)  # CE loss expects long
+
+        return self.tf_img(img), torch.from_numpy(mask)
 
 # ----------------- Build loaders -----------------
 def build_loaders(imgsz, batch):
-    train_ds = SemSegDataset(train_dir, imgsz, num_classes=num_classes, preload=PRELOAD)
-    val_ds   = SemSegDataset(valid_dir, imgsz, num_classes=num_classes, preload=PRELOAD)
+    train_ds = SemSegDataset(train_dir, imgsz)
+    val_ds   = SemSegDataset(valid_dir, imgsz)
     train_dl = DataLoader(train_ds, batch_size=batch, shuffle=True,
-                          num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=False)
+                          num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     val_dl   = DataLoader(val_ds,   batch_size=max(1, batch//2), shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=False)
+                          num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     return train_ds, val_ds, train_dl, val_dl
 
 train_ds, val_ds, train_dl, val_dl = build_loaders(IMGSZ, BATCH)
 print(f"Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
 
-# ----------------- Model (T4-friendly choices) -----------------
-def build_model(name: str, num_classes: int):
-    name = name.lower().strip()
-    if name == "deeplabv3_resnet50":
-        try:
-            weights = models.segmentation.DeepLabV3_ResNet50_Weights.DEFAULT
-        except Exception:
-            weights = None
-        m = models.segmentation.deeplabv3_resnet50(weights=weights, weights_backbone=None)
-        m.classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
-        if getattr(m, "aux_classifier", None) is not None:
-            m.aux_classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
-        return m
+# ----------------- Model (เปลี่ยนตรงนี้ได้บรรทัดเดียว) -----------------
+# ค่าเริ่มต้น: LR-ASPP MobileNetV3 (เร็ว/เบา เหมาะ GPU 4GB)
+# ตัวเลือกอื่น:
+#   models.segmentation.deeplabv3_mobilenet_v3_large(...)
+#   models.segmentation.fcn_resnet50(...)
+#   models.segmentation.deeplabv3_resnet50(...)
+model = models.segmentation.lraspp_mobilenet_v3_large(
+    weights=None, num_classes=num_classes
+).to(DEVICE)
 
-    if name == "deeplabv3_resnet101":
-        try:
-            weights = models.segmentation.DeepLabV3_ResNet101_Weights.DEFAULT
-        except Exception:
-            weights = None
-        m = models.segmentation.deeplabv3_resnet101(weights=weights, weights_backbone=None)
-        m.classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
-        if getattr(m, "aux_classifier", None) is not None:
-            m.aux_classifier[-1] = nn.Conv2d(256, num_classes, kernel_size=1)
-        return m
-
-    if name == "lraspp_mbv3":
-        return models.segmentation.lraspp_mobilenet_v3_large(weights=None, num_classes=num_classes)
-
-    raise ValueError(f"Unknown MODEL={name}")
-
-model = build_model(MODEL_NAME, num_classes).to(DEVICE)
-
-# (ทางเลือก) compile เพื่อเร่งความเร็วบน PyTorch 2.x
-if USE_COMPILE and hasattr(torch, "compile"):
-    try:
-        model = torch.compile(model)
-        print("torch.compile -> enabled")
-    except Exception as _e:
-        print("torch.compile -> skipped:", str(_e))
-
-# เริ่มจาก unfreeze ทั้งหมด (จะ freeze ในลูปตาม FREEZE_BACKBONE_EPOCHS)
+# (ทางเลือก) freeze backbone ช่วงแรกให้อุ่นเร็วขึ้น
 for p in model.backbone.parameters():
-    p.requires_grad = True
+    p.requires_grad = True  # จะสลับในลูป
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -380,16 +255,9 @@ def evaluate(loader):
             pred_c = (preds == c); mask_c = (masks == c)
             inter[c] += (pred_c & mask_c).sum()
             union[c] += (pred_c | mask_c).sum()
-        # ล้างตัวแปรชั่วคราวภายในลูปเพื่อช่วย GC เร็วขึ้น
-        del out, preds, imgs, masks
 
     miou = (inter / (union + 1e-9)).mean().item()
     pix_acc = total_correct / max(1, total_pixels)
-
-    # เก็บกวาดหลังประเมิน (ไม่กระทบสปีดแบบมีนัย)
-    torch.cuda.empty_cache()
-    gc.collect()
-
     return miou, pix_acc
 
 # ----------------- Helpers -----------------
@@ -410,7 +278,7 @@ def append_log(path: Path, epoch:int, loss:float, miou:float, pixacc:float,
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{epoch},{loss:.6f},{miou:.6f},{pixacc:.6f},{imgsz},{batch},{accum},{freeze},{amp},{time_sec:.3f}\n")
 
-# ----------------- OOM-safe Train -----------------
+# ----------------- OOM-safe Train (ลด batch/imgsz อัตโนมัติ + AMP fallback + TQDM + CSV) -----------------
 def try_train(epochs, imgsz, batch, accum):
     global train_ds, val_ds, train_dl, val_dl, USE_AMP
 
@@ -434,13 +302,14 @@ def try_train(epochs, imgsz, batch, accum):
 
         itr = enumerate(train_dl, start=1)
         if USE_TQDM:
-            itr = tqdm(itr, total=len(train_dl), ncols=100, leave=False, mininterval=0.5, desc=f"Epoch {e}/{epochs}")
+            itr = tqdm(itr, total=len(train_dl), ncols=100, leave=False, desc=f"Epoch {e}/{epochs}")
 
         try:
             for i, (imgs, masks) in itr:
                 imgs = imgs.to(DEVICE, non_blocking=True)
                 masks = masks.to(DEVICE, non_blocking=True)
 
+                # AMP autocast + fallback dtype mismatch -> ปิด AMP เฟรมนี้แล้วรัน fp32
                 try:
                     with torch.amp.autocast('cuda', enabled=torch.cuda.is_available() and USE_AMP):
                         out = model(imgs)['out']
@@ -467,9 +336,7 @@ def try_train(epochs, imgsz, batch, accum):
                 epoch_loss += float(loss.item()) * accum
                 steps += 1
 
-                # ช่วย GC ในลูป (ไม่กระทบความเร็วเชิงสังเกต)
-                del out, imgs, masks, loss
-
+                # อัปเดตข้อความใน tqdm หรือพิมพ์ทุก LOG_EVERY
                 if USE_TQDM:
                     itr.set_postfix({
                         "loss": f"{(epoch_loss/max(1,steps)):.4f}",
@@ -498,6 +365,7 @@ def try_train(epochs, imgsz, batch, accum):
                 new_imgsz = imgsz if new_batch < batch else next_down_imgsz(imgsz)
 
                 if new_batch == batch and new_imgsz == imgsz:
+                    # ลองปิด AMP แล้วรันต่อ ถ้ายังไม่ได้จริง ๆ ค่อยยอมแพ้
                     if USE_AMP:
                         print("[OOM] Disable AMP and retry this epoch.")
                         USE_AMP = False
@@ -506,7 +374,6 @@ def try_train(epochs, imgsz, batch, accum):
                     raise
 
                 print(f"[OOM] ลดพารามิเตอร์ -> batch {batch}->{new_batch}, imgsz {imgsz}->{new_imgsz}")
-                # RAM_CACHE ยังอยู่ แค่ rebuild loaders ใหม่ให้ resize ตาม imgsz ใหม่
                 train_ds, val_ds, train_dl, val_dl = build_loaders(new_imgsz, new_batch)
                 return try_train(epochs, new_imgsz, new_batch, accum)
             else:
@@ -521,27 +388,25 @@ def try_train(epochs, imgsz, batch, accum):
               f"time={elapsed_epoch:.1f}s",
               flush=True)
 
+        # CSV log
         append_log(Path(LOG_FILE), e, avg_loss, miou, pix_acc, imgsz, batch, accum, int(freeze_now), int(USE_AMP), elapsed_epoch)
 
+        # save best
         save_dir = Path("runs/semseg"); save_dir.mkdir(parents=True, exist_ok=True)
-        best_path = save_dir / f"best_{MODEL_NAME}.pth"
+        best_path = save_dir / "best_lraspp_mbv3.pth"
         if miou > best_mIoU:
             best_mIoU = miou
             torch.save({"model": model.state_dict(),
                         "num_classes": num_classes,
                         "class_names": class_names,
-                        "imgsz": imgsz,
-                        "model_name": MODEL_NAME}, best_path)
+                        "imgsz": imgsz}, best_path)
             print(f"  -> Saved best to {best_path} (mIoU={best_mIoU:.4f})")
             bad_epochs = 0
         else:
             bad_epochs += 1
             if bad_epochs >= patience:
                 print(f"Early stopping (no improvement for {patience} epochs). Best mIoU={best_mIoU:.4f}")
-                # ไม่ลืมเก็บกวาดก่อน break
-        # เก็บกวาดหลังจบ epoch (คืน RAM/VRAM ที่ไม่ใช้)
-        torch.cuda.empty_cache()
-        gc.collect()
+                break
 
     print("Training finished.")
     return imgsz, batch
@@ -562,7 +427,7 @@ if len(sys.argv) > 1:
     else:
         img_paths = [src]
 
-    ckpt_path = Path("runs/semseg") / f"best_{MODEL_NAME}.pth"
+    ckpt_path = Path("runs/semseg/best_lraspp_mbv3.pth")
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
@@ -586,7 +451,3 @@ if len(sys.argv) > 1:
                 pred = model(t)['out'].argmax(1)[0].detach().cpu().numpy().astype(np.uint8)
             Image.fromarray(pred).save(out_dir / (p.stem + "_mask.png"))
             print("Saved:", out_dir / (p.stem + "_mask.png"))
-            del t, pred  # เก็บกวาดทันที
-    torch.cuda.empty_cache(); gc.collect()
-
-
