@@ -11,17 +11,21 @@
 #   RF_WORKSPACE=hoi-rmqtp
 #   RF_PROJECT=human-object-interaction-pcpk1
 #   RF_VERSION=2
-#   IMGSZ=640
-#   BATCH=10
+#   IMGSZ=512
+#   BATCH=4
 #   EPOCHS=20
 #   LR=0.0003
 #   ACCUM=8
-#   AMP=1                      # 0=ปิด AMP (แนะนำการ์ด 4GB), 1=เปิด AMP
+#   AMP=0                      # 0=ปิด AMP (แนะนำการ์ด 4GB), 1=เปิด AMP
 #   FREEZE_BACKBONE_EPOCHS=5   # 0=ไม่ freeze
 #   USE_TQDM=1                 # 1=แสดง progress bar
 #   LOG_EVERY=10               # ใช้เมื่อตั้ง USE_TQDM=0
 #   LOG_FILE=runs/semseg/train_log.csv
 
+
+
+
+from contextlib import nullcontext
 import os, sys, csv, random, numpy as np
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -133,6 +137,158 @@ classes_csv = find_classes_csv(dataset_root, train_dir, valid_dir, test_dir)
 class_names = read_classes(classes_csv)
 num_classes = 1 + len(class_names)  # 0=background
 print(f"Classes ({num_classes}): ['bg', {', '.join(map(str,class_names))}]")
+
+
+def ensure_log_header(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not log_path.exists():
+        with log_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            # เพิ่มคอลัมน์ metrics ตอน validate
+            w.writerow([
+                "epoch","loss",
+                "val_mIoU","val_pixAcc",
+                "val_cls_Acc","val_cls_Precision","val_cls_Recall","val_cls_F1",
+                "val_mAP",
+                "imgsz","batch","accum","freeze","AMP","time_s"
+            ])
+
+def append_log(log_path: Path, epoch, loss,
+               miou, pix_acc,
+               imgsz, batch, accum, freeze, amp, time_s,
+               cls_acc=None, cls_prec=None, cls_rec=None, cls_f1=None, map_val=None):
+    with log_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        # หากบางค่าคำนวณไม่ได้ ให้เป็นค่าว่าง
+        row = [
+            epoch, f"{loss:.6f}",
+            (None if miou is None else f"{miou:.6f}"),
+            (None if pix_acc is None else f"{pix_acc:.6f}"),
+            (None if cls_acc is None else f"{cls_acc:.6f}"),
+            (None if cls_prec is None else f"{cls_prec:.6f}"),
+            (None if cls_rec is None else f"{cls_rec:.6f}"),
+            (None if cls_f1 is None else f"{cls_f1:.6f}"),
+            (None if map_val is None else f"{map_val:.6f}"),
+            imgsz, batch, accum, freeze, amp, f"{time_s:.3f}"
+        ]
+        w.writerow(row)
+
+@torch.no_grad()
+def evaluate_metrics(model, val_dl, num_classes, device="cuda", use_amp=False):
+    """
+    คำนวณ:
+      - Pixel Accuracy (ต่อพิกเซล)
+      - mIoU (mean IoU แบบต่อคลาส เฉลี่ยเฉพาะคลาสที่มี union > 0)
+      - Macro Precision/Recall/F1 สำหรับ 'per-pixel classification'
+    หมายเหตุ: mAP ไม่คำนวณใน semantic segmentation (คืน None)
+    """
+    model.eval()
+
+    # เก็บสถิติสำหรับ confusion/IU
+    total_correct = 0
+    total_pixels = 0
+
+    # ต่อคลาส: TP≈intersection, FP, FN
+    intersection = torch.zeros(num_classes, dtype=torch.float64, device=device)
+    union        = torch.zeros(num_classes, dtype=torch.float64, device=device)
+    tp           = torch.zeros(num_classes, dtype=torch.float64, device=device)
+    fp           = torch.zeros(num_classes, dtype=torch.float64, device=device)
+    fn           = torch.zeros(num_classes, dtype=torch.float64, device=device)
+
+    amp_ctx = torch.amp.autocast('cuda') if (device.startswith("cuda") and use_amp) else nullcontext()
+
+    for imgs, masks in val_dl:
+        imgs  = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)  # [N,H,W] คลาสเป็น int
+
+        with amp_ctx:
+            logits = model(imgs)['out']              # [N,C,H,W]
+        preds = torch.argmax(logits, dim=1)          # [N,H,W]
+
+        # Pixel accuracy
+        correct = (preds == masks).sum()
+        pixels  = masks.numel()
+        total_correct += correct.item()
+        total_pixels  += pixels
+
+        # Flatten
+        p = preds.view(-1)
+        t = masks.view(-1)
+
+        # ข้าม ignore index ถ้ามี (เช่น 255)
+        ignore = (t < 0) | (t >= num_classes)
+        if ignore.any():
+            p = p[~ignore]
+            t = t[~ignore]
+        if p.numel() == 0:
+            continue
+
+        # ต่อคลาส: intersection & union
+        for c in range(num_classes):
+            pc = (p == c)
+            tc = (t == c)
+            inter = (pc & tc).sum()
+            uni   = pc.sum() + tc.sum() - inter
+
+            intersection[c] += inter
+            union[c]        += uni
+
+            tp[c] += inter
+            fp[c] += (pc.sum() - inter)
+            fn[c] += (tc.sum() - inter)
+
+    pix_acc = float(total_correct) / float(max(1, total_pixels))
+
+    # mIoU เฉลี่ยเฉพาะคลาสที่มี union>0
+    valid = (union > 0)
+    if valid.any():
+        iou_per_class = (intersection[valid] / union[valid]).clamp(min=0.0, max=1.0)
+        miou = float(iou_per_class.mean().item())
+    else:
+        miou = 0.0
+
+    # Macro Precision/Recall/F1 (เฉลี่ยเฉพาะคลาสที่มี support)
+    denom_prec = (tp + fp)
+    denom_rec  = (tp + fn)
+    has_prec   = (denom_prec > 0)
+    has_rec    = (denom_rec > 0)
+
+    precision_c = torch.zeros_like(tp)
+    recall_c    = torch.zeros_like(tp)
+
+    precision_c[has_prec] = (tp[has_prec] / denom_prec[has_prec]).clamp(min=0.0, max=1.0)
+    recall_c[has_rec]     = (tp[has_rec] / denom_rec[has_rec]).clamp(min=0.0, max=1.0)
+
+    # F1 ต่อคลาส
+    denom_f1 = (precision_c + recall_c)
+    has_f1   = (denom_f1 > 0)
+    f1_c     = torch.zeros_like(tp)
+    f1_c[has_f1] = 2.0 * precision_c[has_f1] * recall_c[has_f1] / denom_f1[has_f1]
+
+    # macro เฉลี่ยเฉพาะคลาสที่มี support จริงๆ (มีอย่างน้อย tp+fn > 0)
+    support = (tp + fn) > 0
+    if support.any():
+        cls_acc = float((tp[support] / (tp[support] + fn[support])).mean().item())  # per-class accuracy ≈ recall macro
+        cls_prec = float(precision_c[support].mean().item())
+        cls_rec  = float(recall_c[support].mean().item())
+        cls_f1   = float(f1_c[support].mean().item())
+    else:
+        cls_acc = cls_prec = cls_rec = cls_f1 = 0.0
+
+    # mAP: ไม่คำนวณใน semantic segmentation นี้
+    map_val = None
+
+    return {
+        "pix_acc": pix_acc,
+        "miou": miou,
+        "cls_acc": cls_acc,
+        "cls_precision": cls_prec,
+        "cls_recall": cls_rec,
+        "cls_f1": cls_f1,
+        "map": map_val
+    }
+
+
 
 # ----------------- Dataset (single-folder: *_mask.png pairing) -----------------
 class SemSegDataset(Dataset):
@@ -279,8 +435,11 @@ def append_log(path: Path, epoch:int, loss:float, miou:float, pixacc:float,
         f.write(f"{epoch},{loss:.6f},{miou:.6f},{pixacc:.6f},{imgsz},{batch},{accum},{freeze},{amp},{time_sec:.3f}\n")
 
 # ----------------- OOM-safe Train (ลด batch/imgsz อัตโนมัติ + AMP fallback + TQDM + CSV) -----------------
+# ====== ส่วนที่แก้ในฟังก์ชัน try_train ======
 def try_train(epochs, imgsz, batch, accum):
     global train_ds, val_ds, train_dl, val_dl, USE_AMP
+    # สมมติว่า model, num_classes, class_names, DEVICE, criterion, optimizer, scaler, LOG_FILE
+    # และ build_loaders/next_down_imgsz มีอยู่แล้ว
 
     best_mIoU = -1.0
     patience = int(os.getenv("PATIENCE", "8"))
@@ -290,7 +449,6 @@ def try_train(epochs, imgsz, batch, accum):
 
     for e in range(1, epochs+1):
         model.train()
-        # freeze backbone เฉพาะช่วงแรก
         freeze_now = (e <= max(0, FREEZE_BACKBONE_EPOCHS))
         for p in model.backbone.parameters():
             p.requires_grad = not freeze_now
@@ -309,7 +467,6 @@ def try_train(epochs, imgsz, batch, accum):
                 imgs = imgs.to(DEVICE, non_blocking=True)
                 masks = masks.to(DEVICE, non_blocking=True)
 
-                # AMP autocast + fallback dtype mismatch -> ปิด AMP เฟรมนี้แล้วรัน fp32
                 try:
                     with torch.amp.autocast('cuda', enabled=torch.cuda.is_available() and USE_AMP):
                         out = model(imgs)['out']
@@ -336,15 +493,11 @@ def try_train(epochs, imgsz, batch, accum):
                 epoch_loss += float(loss.item()) * accum
                 steps += 1
 
-                # อัปเดตข้อความใน tqdm หรือพิมพ์ทุก LOG_EVERY
                 if USE_TQDM:
                     itr.set_postfix({
                         "loss": f"{(epoch_loss/max(1,steps)):.4f}",
-                        "bs": batch,
-                        "img": imgsz,
-                        "accum": accum,
-                        "AMP": int(USE_AMP),
-                        "frz": "Y" if freeze_now else "N"
+                        "bs": batch, "img": imgsz, "accum": accum,
+                        "AMP": int(USE_AMP), "frz": "Y" if freeze_now else "N"
                     })
                 elif i % LOG_EVERY == 0:
                     elapsed = time() - t0
@@ -357,7 +510,6 @@ def try_train(epochs, imgsz, batch, accum):
                           flush=True)
 
         except RuntimeError as e:
-            # กัน OOM: ลด batch → ลด imgsz แล้ว rebuild loaders + retry epoch นี้ใหม่
             msg = str(e).lower()
             if "out of memory" in msg or "cuda" in msg:
                 torch.cuda.empty_cache()
@@ -365,7 +517,6 @@ def try_train(epochs, imgsz, batch, accum):
                 new_imgsz = imgsz if new_batch < batch else next_down_imgsz(imgsz)
 
                 if new_batch == batch and new_imgsz == imgsz:
-                    # ลองปิด AMP แล้วรันต่อ ถ้ายังไม่ได้จริง ๆ ค่อยยอมแพ้
                     if USE_AMP:
                         print("[OOM] Disable AMP and retry this epoch.")
                         USE_AMP = False
@@ -380,16 +531,32 @@ def try_train(epochs, imgsz, batch, accum):
                 raise
 
         avg_loss = epoch_loss / max(1, steps)
-        miou, pix_acc = evaluate(val_dl)
+
+        # ===== ใช้ evaluator ใหม่ที่คำนวณ metrics ครบชุด =====
+        val_metrics = evaluate_metrics(model, val_dl, num_classes=num_classes, device=DEVICE, use_amp=False)
+        miou     = val_metrics["miou"]
+        pix_acc  = val_metrics["pix_acc"]
+        cls_acc  = val_metrics["cls_acc"]
+        cls_prec = val_metrics["cls_precision"]
+        cls_rec  = val_metrics["cls_recall"]
+        cls_f1   = val_metrics["cls_f1"]
+        map_val  = val_metrics["map"]  # จะเป็น None ใน semantic segmentation
+
         elapsed_epoch = time() - t0
 
-        print(f"[Epoch {e:03d}/{epochs}] loss={avg_loss:.4f} | val mIoU={miou:.4f} | pixAcc={pix_acc:.4f} | "
+        print(f"[Epoch {e:03d}/{epochs}] loss={avg_loss:.4f} | "
+              f"val mIoU={miou:.4f} | pixAcc={pix_acc:.4f} | "
+              f"clsAcc={cls_acc:.4f} P={cls_prec:.4f} R={cls_rec:.4f} F1={cls_f1:.4f} | "
+              f"mAP={map_val if map_val is not None else '—'} | "
               f"imgsz={imgsz} batch={batch} accum={accum} freeze={'Y' if freeze_now else 'N'} AMP={int(USE_AMP)} | "
               f"time={elapsed_epoch:.1f}s",
               flush=True)
 
-        # CSV log
-        append_log(Path(LOG_FILE), e, avg_loss, miou, pix_acc, imgsz, batch, accum, int(freeze_now), int(USE_AMP), elapsed_epoch)
+        # ===== CSV log (เพิ่ม metrics) =====
+        append_log(Path(LOG_FILE), e, avg_loss,
+                   miou, pix_acc,
+                   imgsz, batch, accum, int(freeze_now), int(USE_AMP), elapsed_epoch,
+                   cls_acc=cls_acc, cls_prec=cls_prec, cls_rec=cls_rec, cls_f1=cls_f1, map_val=map_val)
 
         # save best
         save_dir = Path("runs/semseg"); save_dir.mkdir(parents=True, exist_ok=True)
@@ -410,6 +577,7 @@ def try_train(epochs, imgsz, batch, accum):
 
     print("Training finished.")
     return imgsz, batch
+
 
 # เพิ่มความเสถียรการคูณเมตริกซ์บน GPU consumer
 torch.set_float32_matmul_precision("medium")
@@ -451,4 +619,3 @@ if len(sys.argv) > 1:
                 pred = model(t)['out'].argmax(1)[0].detach().cpu().numpy().astype(np.uint8)
             Image.fromarray(pred).save(out_dir / (p.stem + "_mask.png"))
             print("Saved:", out_dir / (p.stem + "_mask.png"))
-
