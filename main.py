@@ -28,7 +28,12 @@
 #   LOG_EVERY=10
 #   LOG_FILE=runs/semseg/train_log.csv
 
-import os, sys, csv, random, numpy as np
+# main.py — Semantic Segmentation (Single-folder)
+# OOM-safe + AMP toggle + Accumulation + TQDM + CSV log + RAM Preload (optimized) + T4-friendly models
+#
+# จุดเน้นรอบนี้: ลด RAM โดยไม่ช้า — ตัดสำเนาไม่จำเป็น, read-only RAM cache, เก็บกวาดหน่วยความจำเป็นจังหวะ
+
+import os, sys, csv, random, numpy as np, platform, gc
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from time import time
@@ -41,9 +46,11 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
-from PIL import Image
+from PIL import Image, ImageFile
 from roboflow import Roboflow
 from tqdm import tqdm
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # เผื่อภาพบางไฟล์ไม่สมบูรณ์
 
 # โหลด .env ถ้ามี
 try:
@@ -59,13 +66,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-cudnn.benchmark = True  # ปรับจูน conv ให้เร็วขึ้น (ดีสำหรับขนาดภาพคงที่)
+cudnn.benchmark = True  # เร่งความเร็ว conv สำหรับ input size คงที่
 
 IMGSZ  = int(os.getenv("IMGSZ", "512"))
 BATCH  = int(os.getenv("BATCH", "4"))
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LR     = float(os.getenv("LR", "3e-4"))
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))      # Windows -> 0
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))      # Windows -> 0 โดยอัตโนมัติด้านล่างเมื่อ PRELOAD=1
 ACCUM  = int(os.getenv("ACCUM", "8"))                 # gradient accumulation steps
 USE_AMP = bool(int(os.getenv("AMP", "0")))            # 0=fp32, 1=AMP
 FREEZE_BACKBONE_EPOCHS = int(os.getenv("FREEZE_BACKBONE_EPOCHS", "5"))
@@ -86,6 +93,11 @@ RF_API_KEY   = env_required("RF_API_KEY")
 RF_WORKSPACE = env_required("RF_WORKSPACE")
 RF_PROJECT   = env_required("RF_PROJECT")
 RF_VERSION   = int(os.getenv("RF_VERSION", "1"))
+
+# ลด RAM duplication: บน Windows (spawn) ถ้า PRELOAD=1 ให้บังคับ NUM_WORKERS=0
+if PRELOAD and platform.system() == "Windows" and NUM_WORKERS > 0:
+    print("[INFO] PRELOAD on Windows may duplicate RAM across workers -> forcing NUM_WORKERS=0")
+    NUM_WORKERS = 0
 
 print(f"Device: {DEVICE}")
 print(
@@ -177,20 +189,24 @@ def preload_split_to_ram(split_dir: Path, expected_classes: int) -> List[Tuple[n
 
     mem_pairs: List[Tuple[np.ndarray, np.ndarray]] = []
     for ip, mp in sorted(pairs_path):
+        # อ่านภาพ -> array (ไม่มี .copy() เพื่อลด RAM; set read-only เพื่อป้องกัน COW กลายเป็น copy)
         with Image.open(ip) as im:
             im = im.convert("RGB")
-            im_np = np.array(im, dtype=np.uint8).copy()
+            im_np = np.array(im, dtype=np.uint8)   # no extra .copy()
+            im_np.setflags(write=False)
 
         with Image.open(mp) as m:
             if m.mode in ["P", "L"]:
-                mk_np = np.array(m, dtype=np.uint8).copy()
+                mk_np = np.array(m, dtype=np.uint8)  # no extra .copy()
             else:
                 arr = np.array(m)
                 h, w = arr.shape[:2]
                 flat = arr.reshape(-1, 3)
-                colors, inv = np.unique(flat, axis=0, return_inverse=True)
+                _, inv = np.unique(flat, axis=0, return_inverse=True)
                 idx_map = inv.reshape(h, w).astype(np.int32)
                 mk_np = np.clip(idx_map, 0, expected_classes-1).astype(np.uint8)
+            # read-only เพื่อช่วย COW
+            mk_np.setflags(write=False)
 
         mem_pairs.append((im_np, mk_np))
 
@@ -208,6 +224,8 @@ class SemSegDataset(Dataset):
     ถ้า PRELOAD=1 -> โหลดภาพทั้งหมดเข้าแรมครั้งเดียว แล้ว resize/normalize ตอน __getitem__
     """
 
+    IMG_EXTS = {".jpg", ".jpeg", ".png"}
+
     def __init__(self, split_dir: Path, img_size=512, num_classes: int = 2, preload: bool = True):
         self.split_dir = Path(split_dir)
         self.img_size = img_size
@@ -221,11 +239,8 @@ class SemSegDataset(Dataset):
             self.length = len(self.mem_pairs)
             print(f"[{self.split_dir.name}] (RAM) pairs: {self.length}")
         else:
-            IMG_EXTS = {".jpg", ".jpeg", ".png"}
             candidates = [p for p in self.split_dir.iterdir()
-                          if p.is_file()
-                          and p.suffix.lower() in IMG_EXTS
-                          and not p.name.endswith("_mask.png")]
+                          if p.is_file() and p.suffix.lower() in self.IMG_EXTS and not p.name.endswith("_mask.png")]
             pairs = []
             for img in candidates:
                 mask = img.with_name(f"{img.stem}_mask.png")
@@ -251,7 +266,8 @@ class SemSegDataset(Dataset):
 
     def __len__(self): return self.length
 
-    def _resize_mask(self, mask_np: np.ndarray, size: int) -> np.ndarray:
+    @staticmethod
+    def _resize_mask(mask_np: np.ndarray, size: int) -> np.ndarray:
         m = Image.fromarray(mask_np)
         m = m.resize((size, size), Image.NEAREST)
         return np.array(m, dtype=np.int64)
@@ -259,8 +275,9 @@ class SemSegDataset(Dataset):
     def __getitem__(self, i):
         if self.preload:
             img_np, mask_np = self.mem_pairs[i]
+            # สร้าง PIL ชั่วคราวเฉพาะตอนแปลง (ไม่สำเนา RAM cache)
             img = Image.fromarray(img_np, mode="RGB")
-            img_t = self.tf_img(img)  # includes Resize
+            img_t = self.tf_img(img)
             mask_resized = self._resize_mask(mask_np, self.img_size)
             return img_t, torch.from_numpy(mask_resized)
         else:
@@ -273,7 +290,7 @@ class SemSegDataset(Dataset):
                 arr = np.array(m)
                 h, w = arr.shape[:2]
                 flat = arr.reshape(-1, 3)
-                colors, inv = np.unique(flat, axis=0, return_inverse=True)
+                _, inv = np.unique(flat, axis=0, return_inverse=True)
                 idx_map = inv.reshape(h, w).astype(np.int32)
                 mask = np.clip(idx_map, 0, self.num_classes-1).astype(np.uint8)
             img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
@@ -363,9 +380,16 @@ def evaluate(loader):
             pred_c = (preds == c); mask_c = (masks == c)
             inter[c] += (pred_c & mask_c).sum()
             union[c] += (pred_c | mask_c).sum()
+        # ล้างตัวแปรชั่วคราวภายในลูปเพื่อช่วย GC เร็วขึ้น
+        del out, preds, imgs, masks
 
     miou = (inter / (union + 1e-9)).mean().item()
     pix_acc = total_correct / max(1, total_pixels)
+
+    # เก็บกวาดหลังประเมิน (ไม่กระทบสปีดแบบมีนัย)
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return miou, pix_acc
 
 # ----------------- Helpers -----------------
@@ -410,7 +434,7 @@ def try_train(epochs, imgsz, batch, accum):
 
         itr = enumerate(train_dl, start=1)
         if USE_TQDM:
-            itr = tqdm(itr, total=len(train_dl), ncols=100, leave=False, desc=f"Epoch {e}/{epochs}")
+            itr = tqdm(itr, total=len(train_dl), ncols=100, leave=False, mininterval=0.5, desc=f"Epoch {e}/{epochs}")
 
         try:
             for i, (imgs, masks) in itr:
@@ -442,6 +466,9 @@ def try_train(epochs, imgsz, batch, accum):
 
                 epoch_loss += float(loss.item()) * accum
                 steps += 1
+
+                # ช่วย GC ในลูป (ไม่กระทบความเร็วเชิงสังเกต)
+                del out, imgs, masks, loss
 
                 if USE_TQDM:
                     itr.set_postfix({
@@ -511,7 +538,10 @@ def try_train(epochs, imgsz, batch, accum):
             bad_epochs += 1
             if bad_epochs >= patience:
                 print(f"Early stopping (no improvement for {patience} epochs). Best mIoU={best_mIoU:.4f}")
-                break
+                # ไม่ลืมเก็บกวาดก่อน break
+        # เก็บกวาดหลังจบ epoch (คืน RAM/VRAM ที่ไม่ใช้)
+        torch.cuda.empty_cache()
+        gc.collect()
 
     print("Training finished.")
     return imgsz, batch
@@ -556,3 +586,7 @@ if len(sys.argv) > 1:
                 pred = model(t)['out'].argmax(1)[0].detach().cpu().numpy().astype(np.uint8)
             Image.fromarray(pred).save(out_dir / (p.stem + "_mask.png"))
             print("Saved:", out_dir / (p.stem + "_mask.png"))
+            del t, pred  # เก็บกวาดทันที
+    torch.cuda.empty_cache(); gc.collect()
+
+
